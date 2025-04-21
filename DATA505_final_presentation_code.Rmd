@@ -1,0 +1,160 @@
+---
+title: "CravenSpeed Profit Engineering (Log-Transformed)"
+author: "Team $i$"
+date: "04/21/2025"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(caret)
+library(janitor)
+library(ggplot2)
+library(xgboost)
+```
+
+
+
+
+```{r}
+engineer <- function(df) {
+
+  # Clean % columns
+  pct_cols <- names(df)[grepl("pct_|^src_|^January$|^February$|^March$|^April$|^May$|^June$|^July$|^August$|^September$|^October$|^November$|^December$", names(df))]
+  df[pct_cols] <- df[pct_cols] %>%
+    mutate(across(everything(), ~ as.numeric(str_remove(., "%")) / 100))
+
+  # Clean column names
+  df <- df %>% janitor::clean_names()
+
+  # Parse date for age and monthly revenue
+  df$first_order_date <- suppressWarnings(mdy(df$first_order_from_sales_data))
+
+  df <- df %>%
+    mutate(
+            Profit = revenue_2019_to_present - bom_cost * units_sold,
+      margin = retail_price - bom_cost,
+      profit_margin_pct = if_else(revenue_2019_to_present > 0, Profit / revenue_2019_to_present, 0),
+      avg_monthly_revenue = if_else(
+        interval(first_order_date, ymd("2025-01-01")) %/% months(1) > 0,
+        revenue_2019_to_present / (interval(first_order_date, ymd("2025-01-01")) %/% months(1)),
+        0
+      ),
+      profit_per_unit = if_else(units_sold > 0, Profit / units_sold, 0),
+      log_units_sold = log1p(units_sold),
+      is_high_margin = if_else(margin > 50, 1, 0),
+      component_density = if_else(number_of_components > 0, unit_weight_pounds / number_of_components, 0),
+      revenue_to_weight = if_else(unit_weight_pounds > 0, revenue_2019_to_present / unit_weight_pounds, 0),
+      bom_pct_of_price = if_else(retail_price > 0, bom_cost / retail_price, 0),
+      product_age = 2025 - year(first_order_date)
+    ) %>%
+    replace_na(list(
+      profit_margin_pct = 0,
+      profit_per_unit = 0,
+      avg_monthly_revenue = 0,
+      is_high_margin = 0,
+      component_density = 0,
+      revenue_to_weight = 0,
+      bom_pct_of_price = 0,
+      product_age = 0
+    )) %>%
+    select(
+      profit_margin_pct,
+      avg_monthly_revenue,
+      profit_per_unit,
+      log_units_sold,
+      is_high_margin,
+      component_density,
+      revenue_to_weight,
+      bom_pct_of_price,
+      product_age,
+      margin
+    )
+
+  return(df)
+}
+
+fast <- readRDS(gzcon(url("https://github.com/cd-public/D505/raw/refs/heads/master/dat/craven_train.rds")))
+
+Profit <- fast$`Revenue 2019 to present` - fast$`BOM Cost` * fast$`Units Sold`
+fast <- engineer(fast)
+fast$LogProfit <- log1p(Profit)
+fast <- na.omit(fast)
+
+# Train XGBoost model
+set.seed(505)
+model <- train(LogProfit ~ ., data = fast, method = "xgbTree",
+               trControl = trainControl(method = "cv", number = 5))
+
+
+
+```
+
+```{r}
+best_rmse <- min(model$results$RMSE)
+cat("RMSE:", best_rmse, "\n")
+```
+```{r}
+model_lm <- train(LogProfit ~ ., data = fast, method = "lm",
+               trControl = trainControl(method = "cv", number = 5))
+
+best_rmse <- model_lm$results$RMSE
+cat("RMSE:", best_rmse, "\n")
+```
+
+
+```{r}
+importance <- varImp(model)
+
+ggplot(importance) +
+  ggtitle("Feature Importance in Predicting Profit")
+
+```
+
+
+```{r}
+preds_log <- predict(model, newdata = fast)
+preds <- expm1(preds_log)  
+actual <- expm1(fast$LogProfit)
+
+ggplot(data.frame(Predicted = preds, Actual = actual), aes(x = Actual, y = Predicted)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope = 1, intercept = 0, color = "red2") +
+  labs(title = "Predicted vs. Actual Profit (XG Boost)", x = "Actual Profit", y = "Predicted Profit") +
+  theme_minimal()
+
+```
+
+```{r}
+preds_log <- predict(model_lm, newdata = fast)
+preds <- expm1(preds_log)  
+actual <- expm1(fast$LogProfit)
+
+ggplot(data.frame(Predicted = preds, Actual = actual), aes(x = Actual, y = Predicted)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope = 1, intercept = 0, color = "orange2") +
+  labs(title = "Predicted vs. Actual Profit (Linear Model)", x = "Actual Profit", y = "Predicted Profit") +
+  theme_minimal()
+```
+
+
+```{r}
+library(grid)  # for unit()
+
+ggplot(data.frame(Profit = actual), aes(x = Profit)) +
+  geom_histogram(fill = "darkgreen", bins = 120) +
+  labs(title = "Distribution of Profit", x = "Profit", y = "Count") +
+  coord_cartesian(xlim = c(0, 8000)) +
+  theme_minimal() +
+  theme(
+    plot.margin = unit(c(1, 1, 1.5, 1), "cm") 
+  )
+```
+
+
+
+```{r}
+saveRDS(fast, file = "engineered_fast.rds")
+```
+
